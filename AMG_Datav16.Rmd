@@ -1,0 +1,1801 @@
+---
+title: "AMG_Datav16"
+author: "Nathan Dowling"
+date: "2026-01-28"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r One, include=FALSE}
+################################################################################
+## Global setup: packages, options, data import + transformation pipeline
+################################################################################
+
+# ---- Packages (used anywhere in the doc) ------------------------------------
+
+library(tidyverse)    # dplyr, tidyr, readr, ggplot2, stringr, etc.
+library(ggrepel)
+library(ggcorrplot)
+
+# Modeling and diagnostics
+library(jtools)       # summ()
+library(performance)  # model_performance(), check_collinearity()
+library(broom)        # tidy(), glance()
+
+# Utilities used in the pipeline
+library(datawizard)   # standardize()
+library(geosphere)    # distHaversine()
+library(MuMIn)        # dredge/model.avg (loaded here so you don't reload later)
+library(AICcmodavg)
+
+# ---- Global options ----------------------------------------------------------
+
+set.seed(123)
+theme_set(theme_minimal())
+options(stringsAsFactors = FALSE)
+
+# ---- Helper: safe numeric coercion ------------------------------------------
+
+as_num <- function(x) suppressWarnings(as.numeric(x))
+
+# ---- Data import -------------------------------------------------------------
+
+amg_data <- readr::read_csv(
+  "/Users/nathandowling/Documents/School/5. USF/Martin Lab/Research Question/AMR_R_Sheetv6.csv",
+  show_col_types = FALSE
+)
+
+# ---- AMG genes vector --------------------------------------------------------
+
+amg_genes <- c("TetW","QnrS","ErmB","TetM","BlaCTX","Sul2","BlaTem","Sul1","TetA")
+
+# ---- Normalize IDs, coerce gene columns numeric, warn if missing ------------
+
+amg_data <- amg_data %>%
+  mutate(Country = Country |> str_squish() |> toupper())
+
+missing_genes <- setdiff(amg_genes, names(amg_data))
+if (length(missing_genes)) {
+  warning("Missing gene columns: ", paste(missing_genes, collapse = ", "))
+}
+
+amg_data <- amg_data %>%
+  mutate(across(all_of(intersect(amg_genes, names(.))), as_num))
+
+# ---- Transformations and scaling --------------------------------------------
+
+amg_data <- amg_data %>%
+  mutate(
+    across(c(GDP, DDD, Co_Pop, Meat_kg, Abx_mg_kg, Urban, Temp, Prec, Alt), as_num),
+
+    # keep raw copies BEFORE creating standardized names below
+    GDP_raw       = GDP,
+    DDD_raw       = DDD,
+    Abx_mg_kg_raw = Abx_mg_kg,
+    Meat_kg_raw   = Meat_kg,
+
+    # per-capita (guard against zero/NA)
+    DDD_pc  = if_else(!is.na(Co_Pop) & Co_Pop > 0, DDD / Co_Pop, NA_real_),
+    GDP_pc  = if_else(!is.na(Co_Pop) & Co_Pop > 0, GDP / Co_Pop, NA_real_),
+    Meat_pc = if_else(!is.na(Co_Pop) & Co_Pop > 0, Meat_kg / Co_Pop, NA_real_),
+
+    # AMR outcomes
+    AMG_Total = rowSums(across(all_of(intersect(amg_genes, names(.))), ~ .x > 0), na.rm = TRUE),
+    Any_AMG   = as.integer(AMG_Total > 0),
+
+    # Farm grouping
+    Farm_Category = if_else(Country %in% c("AUSTRALIA","ISRAEL","NEW ZEALAND","SPAIN"),
+                            "Farm", "Non-Farm"),
+    Farm = factor(Farm_Category),
+
+    # 0–1 urban scale
+    Urban_Scaled = Urban / 100
+  ) %>%
+  mutate(
+    # Create standardized predictors using the NEW names requested
+    GDP                = standardize(GDP_pc),      # was Scaled_GDP_pc
+    DDD                = standardize(DDD_pc),      # was Scaled_DDD_pc
+    `Meat Consumption` = standardize(Meat_pc),     # was Scaled_Meat_pc
+    Abx_Livestock      = standardize(Abx_mg_kg)    # was Scaled_Abx_mg_kg
+  )
+
+# ---- WWTP distances (country-level proxy) -----------------------------------
+
+coords_list <- list(
+  AUSTRALIA     = c(144.16,  -38.15,   144.41562, -38.28361),
+  CANADA        = c(-113.32,  53.29,  -113.41522, 53.56119),
+  ISRAEL        = c(34.44,    31.42,    34.40042, 31.47496),
+  NETHERLANDS   = c(4.26,     51.44,     4.24255, 51.40049),
+  `NEW ZEALAND` = c(171.45,  -43.02,   172.69681, -43.51238),
+  SENEGAL       = c(14.42,   -16.9667,  14.39552, -16.93287),
+  SPAIN         = c(-0.42,    39.22,    -0.40343, 39.26640),
+  VIETNAM       = c(107.08,   10.32,   107.12171, 10.40166)
+)
+
+wwtp_distances <- purrr::map_dbl(
+  coords_list,
+  ~ geosphere::distHaversine(.x[1:2], .x[3:4]) / 1000
+)
+
+amg_data <- amg_data %>%
+  mutate(
+    WWTP_Distance_km = unname(wwtp_distances[Country]),
+    WWTP             = standardize(WWTP_Distance_km)   # was Scaled_WWTP
+  )
+
+# ---- Stewardship ranks (2025 snapshot) --------------------------------------
+
+stewardship_ranks_df <- tibble(
+  Country = c("NETHERLANDS","AUSTRALIA","CANADA","SPAIN","NEW ZEALAND",
+              "ISRAEL","VIETNAM","SENEGAL"),
+  Veterinary_Prescription_Requirement = c(1,1,1,1,1,1,0,0),
+  OTC_Ban_Humans_Animals              = c(1,1,1,0.5,1,1,0,0),
+  Human_Prescription_Requirement      = c(1,1,1,0.75,1,1,0.25,0),
+  Enforcement_and_Monitoring          = c(1,1,1,0.75,0.75,0.5,0.25,0),
+  Advanced_Stewardship                = c(1,0.75,0.5,0.75,1,0,0.25,0)
+) %>%
+  mutate(
+    Country = Country |> str_squish() |> toupper(),
+    Total_Score = rowSums(across(where(is.numeric)))
+  ) %>%
+  arrange(desc(Total_Score))
+
+# Drop any stale stewardship cols then join once
+amg_data <- amg_data %>%
+  select(-any_of(c(
+    "Veterinary_Prescription_Requirement","OTC_Ban_Humans_Animals",
+    "Human_Prescription_Requirement","Enforcement_and_Monitoring",
+    "Advanced_Stewardship","Total_Score"
+  ))) %>%
+  left_join(stewardship_ranks_df, by = "Country")
+
+# ---- Country-level summary table (for plots/models) -------------------------
+
+summary_df <- amg_data %>%
+  group_by(Country) %>%
+  summarise(
+    Veterinary_Prescription_Requirement = first(Veterinary_Prescription_Requirement),
+    OTC_Ban_Humans_Animals              = first(OTC_Ban_Humans_Animals),
+    Human_Prescription_Requirement      = first(Human_Prescription_Requirement),
+    Enforcement_and_Monitoring          = first(Enforcement_and_Monitoring),
+    Advanced_Stewardship                = first(Advanced_Stewardship),
+    Total_Score                         = first(Total_Score),
+
+    AMG_Prev                            = mean(Any_AMG, na.rm = TRUE),
+    TetM                                = mean(TetM > 0, na.rm = TRUE),
+
+    GDP_raw                             = mean(GDP_raw, na.rm = TRUE),
+    GDP_pc                              = mean(GDP_pc,  na.rm = TRUE),
+    GDP                                 = mean(GDP,     na.rm = TRUE),
+
+    DDD_raw                             = mean(DDD_raw, na.rm = TRUE),
+    DDD_pc                              = mean(DDD_pc,  na.rm = TRUE),
+    DDD                                 = mean(DDD,     na.rm = TRUE),
+
+    Abx_mg_kg_raw                       = mean(Abx_mg_kg_raw, na.rm = TRUE),
+    Abx_Livestock                       = mean(Abx_Livestock,  na.rm = TRUE),
+
+    Farm                                = factor(first(Farm_Category)),
+    Urban                               = mean(Urban, na.rm = TRUE),
+    Temp                                = mean(Temp, na.rm = TRUE),
+    Prec                                = mean(Prec, na.rm = TRUE),
+    Alt                                 = mean(Alt, na.rm = TRUE),
+
+    Meat_kg_raw                         = mean(Meat_kg_raw, na.rm = TRUE),
+    Meat_pc                             = mean(Meat_pc,     na.rm = TRUE),
+    `Meat Consumption`                  = mean(`Meat Consumption`, na.rm = TRUE),
+
+    Co_Pop                              = mean(Co_Pop, na.rm = TRUE),
+
+    WWTP_Distance_km                    = mean(WWTP_Distance_km, na.rm = TRUE),
+    WWTP                                = mean(WWTP,            na.rm = TRUE),
+
+    Sample_Size                         = n(),
+    Label                               = paste0("n=", n(), " ",
+                                                 round(mean(Any_AMG, na.rm = TRUE) * 100, 1), "%"),
+    .groups = "drop"
+  )
+
+# ---- Stewardship domain weights + weighted index (for weighted models) -------
+
+domain_weights <- c(
+  "OTC_Ban_Humans_Animals"              = 0.30,
+  "Advanced_Stewardship"                = 0.25,
+  "Enforcement_and_Monitoring"          = 0.20,
+  "Human_Prescription_Requirement"      = 0.15,
+  "Veterinary_Prescription_Requirement" = 0.10
+)
+
+# quick QA check so models don't fail silently
+needed_domains <- names(domain_weights)
+missing_domains <- setdiff(needed_domains, names(summary_df))
+if (length(missing_domains)) {
+  stop("Missing stewardship columns in summary_df: ", paste(missing_domains, collapse = ", "))
+}
+
+summary_df <- summary_df %>%
+  mutate(
+    Stewardship_Weighted =
+      OTC_Ban_Humans_Animals              * domain_weights["OTC_Ban_Humans_Animals"] +
+      Advanced_Stewardship                * domain_weights["Advanced_Stewardship"] +
+      Enforcement_and_Monitoring          * domain_weights["Enforcement_and_Monitoring"] +
+      Human_Prescription_Requirement      * domain_weights["Human_Prescription_Requirement"] +
+      Veterinary_Prescription_Requirement * domain_weights["Veterinary_Prescription_Requirement"]
+  )
+
+# ---- Mechanism mapping (gene -> mechanism; long format) ----------------------
+
+gene_mech_lut <- tibble::tribble(
+  ~gene,     ~mechanism,
+  "BlaCTX",  "Cell Wall Synthesis Inhibitors",
+  "BlaTem",  "Cell Wall Synthesis Inhibitors",
+  "QnrS",    "DNA Synthesis Inhibitors",
+  "Sul1",    "Folic Acid Synthesis Inhibitors",
+  "Sul2",    "Folic Acid Synthesis Inhibitors",
+  "ErmB",    "Protein Synthesis Inhibitors",
+  "TetA",    "Protein Synthesis Inhibitors",
+  "TetM",    "Protein Synthesis Inhibitors",
+  "TetW",    "Protein Synthesis Inhibitors"
+)
+
+amg_long_mech <- amg_data %>%
+  pivot_longer(
+    cols = all_of(intersect(amg_genes, names(amg_data))),
+    names_to = "gene",
+    values_to = "value"
+  ) %>%
+  mutate(
+    gene = str_trim(gene),
+    value = as.numeric(value)
+  ) %>%
+  left_join(gene_mech_lut, by = "gene") %>%
+  mutate(mechanism = if_else(is.na(mechanism), "Other/Unmapped", mechanism))
+
+mech_country <- amg_long_mech %>%
+  group_by(Country, mechanism) %>%
+  summarise(detected = sum(value == 1, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Country) %>%
+  mutate(prop = detected / sum(detected)) %>%
+  ungroup()
+
+gene_within_mech <- amg_long_mech %>%
+  group_by(Country, mechanism, gene) %>%
+  summarise(detected = sum(value == 1, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Country, mechanism) %>%
+  mutate(prop_within_mech = detected / sum(detected)) %>%
+  ungroup()
+
+```
+
+
+
+```{r Two, echo=FALSE}
+################################################################################
+## Stacked ARG Prevalence by Country + Adjacent Richness Bar (Heat Gradient, 0–100%)
+################################################################################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(ggnewscale)  # allows a second fill scale (AMG discrete + Richness continuous)
+
+# 1) Build long-form data and compute prevalence and stacking proportions
+amg_long <- amg_data %>%
+  pivot_longer(
+    cols = all_of(amg_genes),
+    names_to = "AMG",
+    values_to = "Presence"
+  ) %>%
+  group_by(Country, AMG) %>%
+  summarise(Gene_Prev = mean(Presence > 0, na.rm = TRUE), .groups = "drop") %>%
+  left_join(
+    amg_data %>%
+      group_by(Country) %>%
+      summarise(
+        Sample_Size  = n(),
+        Any_AMG_Prev = mean(rowSums(across(all_of(amg_genes)) > 0) > 0, na.rm = TRUE),
+        Label        = paste0("n=", n(), "\n", percent(Any_AMG_Prev, accuracy = 0.1)),
+        .groups = "drop"
+      ),
+    by = "Country"
+  ) %>%
+  group_by(Country) %>%
+  mutate(
+    total_gene_prev = sum(Gene_Prev, na.rm = TRUE),
+    stacked = if_else(
+      total_gene_prev > 0,
+      Any_AMG_Prev * Gene_Prev / total_gene_prev,
+      0
+    )
+  ) %>%
+  ungroup()
+
+# 2) Country order by descending Any_AMG_Prev
+country_order <- amg_long %>%
+  distinct(Country, Any_AMG_Prev) %>%
+  arrange(desc(Any_AMG_Prev)) %>%
+  pull(Country)
+
+amg_long$Country <- factor(amg_long$Country, levels = country_order)
+
+# 3) Labels inside stacked bars
+label_df <- amg_long %>%
+  distinct(Country, Any_AMG_Prev, Label) %>%
+  mutate(
+    Country = factor(Country, levels = country_order),
+    y_pos = pmin(Any_AMG_Prev * 0.5, 0.95)
+  )
+
+# 4) Richness per country (0–9) + map to prevalence space (0–1)
+max_rich <- length(amg_genes)  # should be 9
+ymax <- 1
+
+rich_to_prev <- function(x) (x / max_rich) * ymax
+prev_to_rich <- function(y) (y / ymax) * max_rich
+
+rich_df <- amg_data %>%
+  group_by(Country) %>%
+  summarise(
+    Richness = sum(colSums(across(all_of(amg_genes))) > 0),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Country   = factor(Country, levels = country_order),
+    Rich_prev = rich_to_prev(Richness)
+  )
+
+# 5) Plot
+p <- ggplot() +
+  # Stacked prevalence bars (discrete fill = AMG)
+  geom_bar(
+    data = amg_long,
+    aes(x = Country, y = stacked, fill = AMG),
+    stat = "identity",
+    width = 0.75
+  ) +
+
+  # Reset fill scale so richness can use a continuous gradient
+  ggnewscale::new_scale_fill() +
+
+  # Richness bars (continuous fill = Richness)
+  geom_col(
+    data = rich_df,
+    aes(x = Country, y = Rich_prev, fill = Richness),
+    width = 0.18,
+    position = position_nudge(x = 0.45),
+    color = "black"
+  ) +
+  # Richness labels
+  geom_text(
+    data = rich_df,
+    aes(x = Country, y = Rich_prev, label = Richness),
+    position = position_nudge(x = 0.45),
+    vjust = -0.4,
+    fontface = "bold",
+    size = 3.6
+  ) +
+  # Labels inside prevalence bars
+  geom_text(
+    data = label_df,
+    aes(x = Country, y = y_pos, label = Label),
+    color = "white",
+    fontface = "bold",
+    size = 3.5,
+    lineheight = 1.2
+  ) +
+  # Left axis = prevalence (0–100%), right axis = richness (0–9)
+  scale_y_continuous(
+    limits = c(0, ymax),
+    labels = percent_format(accuracy = 1),
+    sec.axis = sec_axis(
+      trans = prev_to_rich,
+      name = paste0("ARG Richness (0–", max_rich, ")")
+    )
+  ) +
+  # Gradient for richness bar
+  scale_fill_gradient(
+    name = "ARG Richness",
+    low = "#FDE0DD",
+    high = "#4B0082"
+  ) +
+  labs(
+    title = "ARG Prevalence by Country with Richness Bars",
+    x = "Country",
+    y = "ARG Prevalence (% of Samples)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+
+```
+
+
+```{r}
+################################################################################
+## Compute Country-Level Gene Richness, Shannon Diversity, Prevalence, Mean, n
+################################################################################
+
+# 0) Define the gene columns that are present
+amg_genes <- c("TetW","TetM","BlaTem","QnrS","BlaCTX","ErmB","Sul1","Sul2","TetA")
+gene_cols <- intersect(amg_genes, names(amg_data))
+if (length(gene_cols) == 0) stop("No gene columns from amg_genes found in amg_data.")
+
+# 1) Make genes binary presence/absence once (and USE it)
+amg_data_bin <- amg_data %>%
+  dplyr::mutate(dplyr::across(tidyselect::all_of(gene_cols), \(x) as.integer(x > 0)))
+
+# 2) Summarise by country: counts per gene + n + prevalence + mean burden
+country_diversity <- amg_data_bin %>%
+  dplyr::group_by(Country) %>%
+  dplyr::summarise(
+    # counts of positives per gene across samples in country
+    dplyr::across(tidyselect::all_of(gene_cols), \(x) sum(x, na.rm = TRUE)),
+
+    # sample size
+    n = dplyr::n(),
+
+    # prevalence of any ARG
+    amg_prev = mean(Any_AMG, na.rm = TRUE),
+
+    # mean ARG burden per sample
+    mean_amg = mean(AMG_Total, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    richness = sum(dplyr::c_across(tidyselect::all_of(gene_cols)) > 0),
+    shannon  = {
+      counts <- dplyr::c_across(tidyselect::all_of(gene_cols))
+      tot <- sum(counts, na.rm = TRUE)
+      if (!is.finite(tot) || tot == 0) 0 else vegan::diversity(counts, index = "shannon")
+    }
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Country, n, amg_prev, mean_amg, richness, shannon) %>%
+  dplyr::arrange(dplyr::desc(richness), dplyr::desc(shannon))
+
+print(country_diversity)
+
+```
+
+```{r id="mech_prev_overall_in_strip_wrapped"}
+# 1) Overall mechanism prevalence across ALL samples (ignoring country)
+mech_prev_overall <- amg_long_mech %>%
+  group_by(Band, mechanism) %>%
+  summarise(any_mech = any(value == 1, na.rm = TRUE), .groups = "drop") %>%
+  group_by(mechanism) %>%
+  summarise(
+    mech_prev = mean(any_mech, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mech_label = paste0(mechanism, " (Prev: ", scales::percent(mech_prev, accuracy = 1), ")"),
+    mech_label = stringr::str_wrap(mech_label, width = 30)
+  )
+
+# 2) Gene composition within each mechanism per country
+gene_within_mech <- amg_long_mech %>%
+  group_by(Country, mechanism, gene) %>%
+  summarise(
+    detected = sum(value == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Country, mechanism) %>%
+  mutate(prop_within_mech = detected / sum(detected)) %>%
+  ungroup()
+
+# 3) Prepare labels for pie slices + attach mechanism strip labels
+gene_within_mech_lab <- gene_within_mech %>%
+  group_by(Country, mechanism) %>%
+  arrange(desc(prop_within_mech)) %>%
+  mutate(
+    ypos  = cumsum(prop_within_mech) - 0.5 * prop_within_mech,
+    label = scales::percent(prop_within_mech, accuracy = 1)
+  ) %>%
+  ungroup() %>%
+  filter(prop_within_mech > 0) %>%
+  left_join(mech_prev_overall, by = "mechanism")
+
+# 4) Plot
+ggplot(gene_within_mech_lab,
+       aes(x = "", y = prop_within_mech, fill = gene)) +
+  geom_col(width = 1, color = "white") +
+  geom_text(aes(y = ypos, label = label),
+            size = 2.5, color = "black") +
+  coord_polar(theta = "y") +
+  facet_grid(mech_label ~ Country) +
+  theme_void() +
+  labs(fill = "Gene")
+
+```
+
+
+```{r id="mech_gene_table_with_prop"}
+# Pretty base table
+mech_gene_table <- tibble::tribble(
+  ~mechanism,                      ~genes,
+  "Cell Wall Synthesis Inhibitors", "BlaCTX, BlaTem",
+  "DNA Synthesis Inhibitors",       "QnrS",
+  "Folic Acid Synthesis Inhibitors","Sul1, Sul2",
+  "Protein Synthesis Inhibitors",   "ErmB, TetA, TetM, TetW"
+)
+
+# Overall mechanism prevalence (% of samples with >=1 gene)
+mech_prev_overall <- amg_long_mech %>%
+  group_by(Band, mechanism) %>%
+  summarise(any_mech = any(value == 1, na.rm = TRUE), .groups = "drop") %>%
+  group_by(mechanism) %>%
+  summarise(
+    proportion = mean(any_mech, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Final table
+mech_gene_table_final <- mech_gene_table %>%
+  left_join(mech_prev_overall, by = "mechanism") %>%
+  mutate(proportion = scales::percent(proportion, accuracy = 1))
+
+mech_gene_table_final
+
+```
+
+```{r}
+# Build pairwise mechanism table (P(var2 | var1)) if it doesn't exist yet
+mech_pa <- amg_long_mech %>%
+  group_by(Band, mechanism) %>%
+  summarise(present = any(value == 1, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = mechanism, values_from = present, values_fill = FALSE)
+
+mech_names <- setdiff(names(mech_pa), "Band")
+
+pairwise_mech <- tidyr::expand_grid(var1 = mech_names, var2 = mech_names) %>%
+  filter(var1 != var2) %>%
+  rowwise() %>%
+  mutate(
+    n_var1 = sum(mech_pa[[var1]], na.rm = TRUE),
+    n_both = sum(mech_pa[[var1]] & mech_pa[[var2]], na.rm = TRUE),
+    pct_var2_given_var1 = ifelse(n_var1 == 0, NA_real_, 100 * n_both / n_var1)
+  ) %>%
+  ungroup()
+
+
+# wrap width controls line breaks; tweak if you want (e.g., 18–28)
+wrap_w <- 22
+
+# 1) Get n per mechanism (from var1 side)
+mech_n <- pairwise_mech %>%
+  select(var1, n_var1) %>%
+  distinct()
+
+# 2) Add wrapped labels with n
+pairwise_mech_wrapped <- pairwise_mech %>%
+  left_join(mech_n, by = c("var1", "n_var1")) %>%  # just to be explicit
+  mutate(
+    var1_lab = paste0(var1, "\n(n = ", n_var1, ")"),
+    var2_lab = paste0(var2, "\n(n = ", 
+                      mech_n$n_var1[match(var2, mech_n$var1)], ")"),
+    var1_w = str_wrap(var1_lab, width = wrap_w),
+    var2_w = str_wrap(var2_lab, width = wrap_w)
+  )
+
+# 3) Plot
+ggplot(pairwise_mech_wrapped,
+       aes(x = var2_w, y = var1_w, fill = pct_var2_given_var1)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(name = "% of (+) samples", limits = c(0, 100)) +
+  geom_text(aes(label = sprintf("%.0f%%", pct_var2_given_var1)),
+            color = "white", size = 4) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 10),
+    plot.title  = element_text(face = "bold"),
+    panel.grid  = element_blank()
+  ) +
+  labs(
+    x = "Also present (ARG Mech 1)",
+    y = "Given present (ARG Mech 2)",
+    title = "Conditional co-occurrence of AMR mechanisms"
+  )
+pairwise_mech %>%
+  mutate(
+    statement = paste0(
+      "Among samples with ", var1,
+      ", ", round(pct_var2_given_var1),
+      "% also had ", var2, "."
+    )
+  ) %>%
+  select(statement)
+```
+
+
+
+Any ARG prevalence was strongly and positively associated with TetM prevalence (r = 0.87, 95% CI: 0.44–0.98, p = 0.0046), with Any ARG explaining 76% of the variance in TetM across countries (R² = 0.76).
+```{r}
+# Short aliases (define once)
+amg_prev  <- summary_df$AMG_Prev
+tetm_prev <- summary_df$TetM
+
+# Correlation + test
+cor(amg_prev, tetm_prev, use = "complete.obs", method = "pearson")
+ct <- cor.test(amg_prev, tetm_prev, method = "pearson")
+ct$estimate
+ct$p.value
+ct$conf.int
+(ct$estimate)^2
+
+# Regression
+tetm_on_amg <- lm(tetm_prev ~ amg_prev)
+summary(tetm_on_amg)
+
+```
+
+
+```{r}
+################################################################################
+## Correlation Matrix: Predictor Variables
+################################################################################
+
+# Create correlation dataset (select scaled or core predictors)
+cor_data <- amg_data %>%
+  select(
+    GDP, 
+    DDD, 
+    Abx_Livestock, 
+    WWTP, 
+    `Meat Consumption`, 
+    Total_Score, 
+    Farm
+  ) %>%
+  mutate(Farm = as.numeric(as.factor(Farm)))
+
+# Compute correlation matrix
+cor_matrix <- cor(cor_data, use = "pairwise.complete.obs")
+
+# Create clean labels (replace underscores and spaces for readability)
+clean_labels <- colnames(cor_matrix)
+clean_labels <- gsub("_", " ", clean_labels)
+clean_labels <- gsub("Meat Consumption", "MeatConsumption", clean_labels)
+clean_labels <- gsub("Abx Livestock", "AbxLivestock", clean_labels)
+clean_labels <- gsub("Total Score", "StewardshipScore", clean_labels)
+
+# Plot
+ggcorrplot(
+  cor_matrix,
+  lab = TRUE,
+  lab_col = "black",
+  type = "lower",
+  show.diag = TRUE,   # display 1.00 on diagonal
+  outline.col = "white",
+  colors = c("#6D9EC1", "white", "#E46726"),
+  title = "Correlation Matrix: Any ARG and Predictor Variables",
+  ggtheme = theme_minimal()
+) +
+  scale_x_discrete(labels = clean_labels) +
+  scale_y_discrete(labels = clean_labels)
+
+
+
+```
+
+
+
+
+
+```{r}
+Any_ARG_Omnibus <- glm(
+  AMG_Prev ~ GDP + Farm + DDD + Abx_Livestock + WWTP,
+  data = summary_df
+)
+
+# LN models (single predictors)
+any_arg_1 <- lm(AMG_Prev ~ GDP, data = summary_df)
+any_arg_2 <- lm(AMG_Prev ~ Farm, data = summary_df)
+any_arg_3 <- lm(AMG_Prev ~ DDD, data = summary_df)
+any_arg_4 <- lm(AMG_Prev ~ Abx_Livestock, data = summary_df)
+any_arg_5 <- lm(AMG_Prev ~ WWTP, data = summary_df)
+
+summ(Any_ARG_Omnibus)
+performance::check_collinearity(Any_ARG_Omnibus)
+
+summ(any_arg_1)
+summ(any_arg_2)
+summ(any_arg_3)
+summ(any_arg_4)
+summ(any_arg_5)
+
+performance::model_performance(any_arg_1)
+performance::model_performance(any_arg_2)
+performance::model_performance(any_arg_3)
+performance::model_performance(any_arg_4)
+performance::model_performance(any_arg_5)
+
+```
+
+
+```{r}
+# Omnibus model
+TetM_Omnibus <- glm(
+  TetM ~ GDP + Farm + DDD + Abx_Livestock + WWTP,
+  data = summary_df
+)
+
+# LN models (single predictors)
+tetm_1 <- lm(TetM ~ GDP, data = summary_df)
+tetm_2 <- lm(TetM ~ Farm, data = summary_df)
+tetm_3 <- lm(TetM ~ DDD, data = summary_df)
+tetm_4 <- lm(TetM ~ Abx_Livestock, data = summary_df)
+tetm_5 <- lm(TetM ~ WWTP, data = summary_df)
+
+# Summaries & diagnostics
+summ(TetM_Omnibus)
+performance::check_collinearity(TetM_Omnibus)
+
+summ(tetm_1)
+summ(tetm_2)
+summ(tetm_3)
+summ(tetm_4)
+summ(tetm_5)
+
+performance::model_performance(tetm_1)
+performance::model_performance(tetm_2)
+performance::model_performance(tetm_3)
+performance::model_performance(tetm_4)
+performance::model_performance(tetm_5)
+
+
+```
+
+
+```{r}
+summary_df <- summary_df %>%
+  left_join(country_diversity %>% select(Country, richness, shannon),
+            by = "Country") 
+
+# Omnibus model
+Richness_Omnibus <- glm(
+  richness ~ GDP + Farm + DDD + Abx_Livestock + WWTP,
+  data = summary_df
+)
+
+# LN models (single predictors)
+rich_1 <- lm(richness ~ GDP, data = summary_df)
+rich_2 <- lm(richness ~ Farm, data = summary_df)
+rich_3 <- lm(richness ~ DDD, data = summary_df)
+rich_4 <- lm(richness ~ Abx_Livestock, data = summary_df)
+rich_5 <- lm(richness ~ WWTP, data = summary_df)
+
+# Summaries & diagnostics
+summ(Richness_Omnibus)
+performance::check_collinearity(Richness_Omnibus)
+
+summ(rich_1); summ(rich_2); summ(rich_3); summ(rich_4); summ(rich_5)
+
+performance::model_performance(rich_1)
+performance::model_performance(rich_2)
+performance::model_performance(rich_3)
+performance::model_performance(rich_4)
+performance::model_performance(rich_5)
+
+```
+
+
+```{r}
+# Omnibus model
+Shannon_Omnibus <- glm(
+  shannon ~ GDP + Farm + DDD + Abx_Livestock + WWTP,
+  data = summary_df
+)
+
+# LN models (single predictors)
+shan_1 <- lm(shannon ~ GDP, data = summary_df)
+shan_2 <- lm(shannon ~ Farm, data = summary_df)
+shan_3 <- lm(shannon ~ DDD, data = summary_df)
+shan_4 <- lm(shannon ~ Abx_Livestock, data = summary_df)
+shan_5 <- lm(shannon ~ WWTP, data = summary_df)
+
+summ(Shannon_Omnibus)
+performance::check_collinearity(Shannon_Omnibus)
+
+summ(shan_1); summ(shan_2); summ(shan_3); summ(shan_4); summ(shan_5)
+
+performance::model_performance(shan_1)
+performance::model_performance(shan_2)
+performance::model_performance(shan_3)
+performance::model_performance(shan_4)
+performance::model_performance(shan_5)
+
+```
+
+```{r, eval=FALSE}
+dat_model <- summary_df
+stopifnot(exists("dat_model"))
+
+# ---- DIAGNOSTICS: data integrity before global model ----
+
+# 1) Identify the exact data object used in the model
+# Replace `dat_model` with whatever you pass as `data = ...` in m_any_global
+stopifnot(exists("dat_model"))
+
+cat("dat_model class:\n")
+print(class(dat_model))
+cat("nrow / ncol:\n")
+print(dim(dat_model))
+
+# 2) Confirm it is truly a data.frame-like object
+if (!is.data.frame(dat_model)) {
+  stop("dat_model is not a data.frame. It is: ", paste(class(dat_model), collapse = ", "))
+}
+
+# 3) List the variables used in the global model (edit to match your formula)
+vars_used <- c(
+  "any_ARG",          # outcome example
+  "GDP_per_capita",   # predictors examples
+  "human_abx_use",
+  "vet_abx_use",
+  "meat_prod",
+  "farm_binary",
+  "dist_wwtp_km",
+  "stewardship_score"
+)
+
+missing_vars <- setdiff(vars_used, names(dat_model))
+if (length(missing_vars) > 0) {
+  stop("These vars are missing from dat_model: ", paste(missing_vars, collapse = ", "))
+}
+
+# 4) NA profile (this is the critical bit for dredge)
+na_counts <- sapply(dat_model[, vars_used, drop = FALSE], function(x) sum(is.na(x)))
+cat("\nNA counts in model vars:\n")
+print(sort(na_counts, decreasing = TRUE))
+
+# 5) Factor sanity checks: dredge/model fitting can break if a factor has 1 level after filtering
+factor_vars <- vars_used[sapply(dat_model[, vars_used, drop = FALSE], is.factor)]
+if (length(factor_vars) > 0) {
+  cat("\nFactor levels:\n")
+  for (v in factor_vars) {
+    cat(v, "levels:", nlevels(dat_model[[v]]), "\n")
+    print(table(dat_model[[v]], useNA = "ifany"))
+    cat("\n")
+  }
+}
+
+# 6) How many complete cases exist for the model?
+cc_n <- sum(stats::complete.cases(dat_model[, vars_used, drop = FALSE]))
+cat("\nComplete cases for model vars:", cc_n, "of", nrow(dat_model), "\n")
+
+# Optional: create a complete-case dataset you can explicitly pass to glm()
+dat_model_cc <- dat_model[stats::complete.cases(dat_model[, vars_used, drop = FALSE]), ]
+cat("dat_model_cc dim:\n")
+print(dim(dat_model_cc))
+
+```
+
+```{r}
+################################################################################
+## Pretty "Top 5 Models" Table for 4 Dredges (AMG_Prev, TetM, Richness, Shannon)
+## (adapted to your current summary_df column names)
+################################################################################
+
+# ---- Guards (minimal) --------------------------------------------------------
+if (!requireNamespace("MuMIn", quietly = TRUE)) stop("Install MuMIn: install.packages('MuMIn')")
+if (!requireNamespace("AICcmodavg", quietly = TRUE)) stop("Install AICcmodavg: install.packages('AICcmodavg')")
+if (!requireNamespace("broom", quietly = TRUE)) stop("Install broom: install.packages('broom')")
+if (!requireNamespace("dplyr", quietly = TRUE)) stop("Install dplyr: install.packages('dplyr')")
+if (!requireNamespace("tibble", quietly = TRUE)) stop("Install tibble: install.packages('tibble')")
+
+has_knitr <- requireNamespace("knitr", quietly = TRUE)
+has_kableExtra <- requireNamespace("kableExtra", quietly = TRUE)
+
+# ---- Ensure Farm is a factor -------------------------------------------------
+summary_df <- summary_df %>% dplyr::mutate(Farm = factor(Farm))
+
+# ---- 0) Build Country-level Richness + Shannon from amg_data -----------------
+# Use your existing amg_genes vector if present; otherwise define it here
+if (!exists("amg_genes")) {
+  amg_genes <- c("TetW","QnrS","ErmB","TetM","BlaCTX","Sul2","BlaTem","Sul1","TetA")
+}
+
+gene_cols <- intersect(amg_genes, names(amg_data))
+if (length(gene_cols) == 0) stop("No gene columns from amg_genes found in amg_data.")
+
+# vegan needed only for Shannon
+if (!requireNamespace("vegan", quietly = TRUE)) {
+  stop("Package 'vegan' is required for Shannon diversity. Install it with install.packages('vegan').")
+}
+
+# Binary copy so we don't mutate amg_data globally
+amg_bin <- amg_data %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(gene_cols), \(x) as.integer(x > 0)))
+
+country_diversity <- amg_bin %>%
+  dplyr::group_by(Country) %>%
+  dplyr::summarise(
+    dplyr::across(dplyr::all_of(gene_cols), \(x) sum(x, na.rm = TRUE)),
+    .groups = "drop_last"
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    richness = sum(dplyr::c_across(dplyr::all_of(gene_cols)) > 0, na.rm = TRUE),
+    shannon  = {
+      counts <- dplyr::c_across(dplyr::all_of(gene_cols))
+      tot <- sum(counts, na.rm = TRUE)
+      if (!is.finite(tot) || tot == 0) 0 else vegan::diversity(counts, index = "shannon")
+    }
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Country, Richness = richness, Shannon = shannon)
+
+# Join into summary_df (now omnibus + dredge can use summary_df only)
+summary_df <- summary_df %>%
+  dplyr::left_join(country_diversity, by = "Country")
+
+# Sanity check
+need_outcomes <- c("AMG_Prev", "TetM", "Richness", "Shannon")
+miss_out <- setdiff(need_outcomes, names(summary_df))
+if (length(miss_out)) stop("Missing outcomes in summary_df after join: ", paste(miss_out, collapse = ", "))
+
+options(na.action = "na.fail")
+
+# ---- 1) Global models (same predictor set) -----------------------------------
+m_any_global  <- lm(AMG_Prev  ~ GDP + Farm + DDD + Abx_Livestock + WWTP, data = summary_df)
+m_tetm_global <- lm(TetM      ~ GDP + Farm + DDD + Abx_Livestock + WWTP, data = summary_df)
+m_rich_global <- glm(Richness ~ GDP + Farm + DDD + Abx_Livestock + WWTP, data = summary_df,
+                     family = poisson(link = "log"))
+m_shan_global <- lm(Shannon   ~ GDP + Farm + DDD + Abx_Livestock + WWTP, data = summary_df)
+
+# ---- 2) Dredge (na.fail required) --------------------------------------------
+old_na_action <- getOption("na.action")
+options(na.action = "na.fail")
+on.exit(options(na.action = old_na_action), add = TRUE)
+
+dd_any  <- MuMIn::dredge(m_any_global)
+dd_tetM <- MuMIn::dredge(m_tetm_global)
+dd_rich <- MuMIn::dredge(m_rich_global)
+dd_shan <- MuMIn::dredge(m_shan_global)
+
+# ---- 3) Helpers for Top-N table ----------------------------------------------
+get_terms <- function(m) {
+  trms <- attr(stats::terms(m), "term.labels")
+  if (length(trms) == 0L) "(Intercept only)" else paste(trms, collapse = " + ")
+}
+
+build_aic_table_from_dredge <- function(dredge_obj, response_name, top_n = 5) {
+  df <- as.data.frame(dredge_obj)
+
+  n_keep <- min(top_n, nrow(df))
+  df_top <- df[seq_len(n_keep), , drop = FALSE]
+
+  mods_top <- MuMIn::get.models(dredge_obj, subset = seq_len(n_keep))
+  model_comp <- vapply(mods_top, get_terms, character(1))
+
+  tibble::tibble(
+    Response          = response_name,
+    Model             = paste0("M", seq_len(n_keep)),
+    model_composition = model_comp,
+    K                 = df_top$df,
+    AICc              = round(df_top$AICc, 2),
+    Delta_AICc        = round(df_top$delta, 2),
+    Weight_wi         = round(as.numeric(df_top$weight), 3)
+  )
+}
+
+# ---- 4) Build + combine Top 6 tables -----------------------------------------
+top6_any  <- build_aic_table_from_dredge(dd_any,  "Any ARG (AMG_Prev)", top_n = 6)
+top6_tetM <- build_aic_table_from_dredge(dd_tetM, "TetM prevalence",    top_n = 6)
+top6_rich <- build_aic_table_from_dredge(dd_rich, "ARG Richness",       top_n = 6)
+top6_shan <- build_aic_table_from_dredge(dd_shan, "Shannon diversity",  top_n = 6)
+
+final_top6 <- dplyr::bind_rows(top6_any, top6_tetM, top6_rich, top6_shan)
+
+# ---- 5) Pretty render ---------------------------------------------------------
+if (has_knitr && has_kableExtra) {
+  final_top6 %>%
+    knitr::kable(
+      format = "html",
+      caption = "Top 6 candidate models (ranked by AICc) for each response",
+      align = "l"
+    ) %>%
+    kableExtra::kable_styling(
+      full_width = FALSE,
+      bootstrap_options = c("striped", "hover", "condensed")
+    ) %>%
+    kableExtra::column_spec(3, width = "30em") %>%
+    kableExtra::collapse_rows(columns = 1, valign = "top") %>%
+    kableExtra::row_spec(0, bold = TRUE)
+} else {
+  print(final_top6)
+}
+
+```
+
+
+
+```{r}
+################################################################################
+## 4 "Top Model" plots (M1 for AMG/TetM/Richness; M2 for Shannon)
+## Titles/axes + 95% CI + per-plot colors + manual R² override (Richness)
+################################################################################
+
+# ------------------------------------------------------------------
+# MANUAL OVERRIDES (edit these numbers if needed)
+# ------------------------------------------------------------------
+manual_r2 <- list(
+  Richness = 0.1209953  # McFadden R² you computed for Richness ~ WWTP
+)
+
+# Pull dredge-ranked models
+m_any  <- MuMIn::get.models(dd_any,  subset = 1)[[1]]  # M1
+m_tet  <- MuMIn::get.models(dd_tetM, subset = 1)[[1]]  # M1
+m_rich <- MuMIn::get.models(dd_rich, subset = 1)[[1]]  # M1 (Poisson glm)
+m_shan <- MuMIn::get.models(dd_shan, subset = 2)[[1]]  # M2 (M1 is intercept)
+
+# ------------------------------------------------------------------
+# Pretty labels (edit freely)
+# ------------------------------------------------------------------
+title_lab <- function(var) {
+  dplyr::recode(var,
+    "AMG_Prev" = "ARG Prevalence",
+    "TetM"     = "TetM Prevalence",
+    "Richness" = "ARG Richness",
+    "Shannon"  = "Shannon Diversity",
+    .default   = var
+  )
+}
+
+y_lab <- function(var) {
+  dplyr::recode(var,
+    "AMG_Prev" = "ARG Prevalence",
+    "TetM"     = "TetM Prevalence",
+    .default   = var
+  )
+}
+
+x_lab <- function(var) {
+  dplyr::recode(var,
+    "GDP"  = "GDP (Per Capita)",
+    "WWTP" = "WWTP (Proximity)",
+    .default = var
+  )
+}
+
+# ------------------------------------------------------------------
+# Plot colors (one scheme per plot)
+# ------------------------------------------------------------------
+plot_colors <- list(
+  AMG_Prev = list(point = "#1f77b4", line = "#d62728", fill = "#1f77b4"),
+  TetM     = list(point = "#2ca02c", line = "#9467bd", fill = "#2ca02c"),
+  Richness = list(point = "#ff7f0e", line = "#8c564b", fill = "#ff7f0e"),
+  Shannon  = list(point = "#17becf", line = "#e377c2", fill = "#17becf")
+)
+
+# ------------------------------------------------------------------
+# Helper: pick primary predictor (first simple RHS term)
+# ------------------------------------------------------------------
+pick_x <- function(m, dat) {
+  trms <- attr(terms(m), "term.labels")
+  if (length(trms) == 0) return(NA_character_)
+  trms <- trms[!grepl(":", trms) & trms %in% names(dat)]
+  if (length(trms) == 0) NA_character_ else trms[1]
+}
+
+# ------------------------------------------------------------------
+# Helper: compute R² + p-value (with manual override option)
+# ------------------------------------------------------------------
+get_r2_p <- function(m, x, y_var) {
+  sm <- summary(m)
+
+  # p-value for x (if present)
+  p <- if (!is.na(x) && x %in% rownames(sm$coefficients)) sm$coefficients[x, 4] else NA_real_
+
+  # If you supplied a manual R² for this response, use it
+  if (!is.null(manual_r2[[y_var]])) {
+    return(list(r2 = manual_r2[[y_var]], p = p, r2_lab = "R²"))
+  }
+
+  # OLS R²
+  if (inherits(m, "lm")) {
+    return(list(r2 = unname(sm$r.squared), p = p, r2_lab = "R²"))
+  }
+
+  # GLM fallback: deviance pseudo-R²
+  r2 <- unname(1 - (m$deviance / m$null.deviance))
+  list(r2 = r2, p = p, r2_lab = "R²")
+}
+
+# ------------------------------------------------------------------
+# Helper: build prediction grid + 95% CI (lm + glm)
+# ------------------------------------------------------------------
+make_pred_grid_ci <- function(m, dat, x_var, n = 100) {
+
+  typical <- dat %>%
+    dplyr::summarise(dplyr::across(dplyr::everything(), \(v) {
+      if (is.numeric(v)) mean(v, na.rm = TRUE)
+      else if (is.factor(v)) levels(v)[1]
+      else if (is.character(v)) sort(unique(v))[1]
+      else NA
+    }))
+
+  if (is.numeric(dat[[x_var]])) {
+    x_seq <- seq(min(dat[[x_var]], na.rm = TRUE),
+                 max(dat[[x_var]], na.rm = TRUE),
+                 length.out = n)
+    grid <- typical[rep(1, length(x_seq)), , drop = FALSE]
+    grid[[x_var]] <- x_seq
+  } else {
+    levs <- levels(factor(dat[[x_var]]))
+    grid <- typical[rep(1, length(levs)), , drop = FALSE]
+    grid[[x_var]] <- factor(levs, levels = levs)
+  }
+
+  if (inherits(m, "lm")) {
+    pr <- predict(m, newdata = grid, se.fit = TRUE)
+    grid$yhat <- as.numeric(pr$fit)
+    grid$lwr  <- grid$yhat - 1.96 * pr$se.fit
+    grid$upr  <- grid$yhat + 1.96 * pr$se.fit
+  } else {
+    pr  <- predict(m, newdata = grid, se.fit = TRUE, type = "link")
+    eta <- as.numeric(pr$fit)
+    se  <- as.numeric(pr$se.fit)
+
+    grid$yhat <- as.numeric(predict(m, newdata = grid, type = "response"))
+    linkinv   <- m$family$linkinv
+    grid$lwr  <- linkinv(eta - 1.96 * se)
+    grid$upr  <- linkinv(eta + 1.96 * se)
+  }
+
+  grid
+}
+
+# ------------------------------------------------------------------
+# Main plotting function
+# ------------------------------------------------------------------
+plot_model <- function(m, y_var, dat) {
+
+  x_var <- pick_x(m, dat)
+  if (is.na(x_var)) stop("No usable predictor found for: ", y_var)
+
+  stats <- get_r2_p(m, x_var, y_var)
+
+  r2_txt <- if (length(stats$r2) == 1 && is.finite(stats$r2)) sprintf("%.3f", stats$r2) else "NA"
+  p_txt  <- if (length(stats$p)  == 1 && is.finite(stats$p))  formatC(stats$p, format = "g", digits = 3) else "NA"
+
+  cols <- plot_colors[[y_var]]
+  if (is.null(cols)) cols <- list(point = "black", line = "black", fill = "grey70")
+
+  d <- dat[, c("Country", y_var, x_var), drop = FALSE]
+  names(d) <- c("Country", "y", "x")
+
+  grid <- make_pred_grid_ci(m, dat, x_var, n = 100)
+
+  if (is.numeric(d$x)) {
+    ggplot(d, aes(x = x, y = y)) +
+      geom_point(size = 3, color = cols$point) +
+      geom_ribbon(
+        data = grid,
+        aes(x = .data[[x_var]], ymin = lwr, ymax = upr),
+        inherit.aes = FALSE,
+        alpha = 0.18,
+        fill = cols$fill
+      ) +
+      geom_line(
+        data = grid,
+        aes(x = .data[[x_var]], y = yhat),
+        inherit.aes = FALSE,
+        linewidth = 1.2,
+        color = cols$line
+      ) +
+      ggrepel::geom_text_repel(aes(label = Country), size = 3.5, max.overlaps = Inf) +
+      labs(
+        title    = paste0(title_lab(y_var), " ~ ", x_var),
+        subtitle = paste0(stats$r2_lab, " = ", r2_txt, " | p = ", p_txt),
+        x = x_lab(x_var),
+        y = y_lab(y_var)
+      ) +
+      theme_minimal(base_size = 14)
+
+  } else {
+    d$x <- factor(d$x)
+    grid[[x_var]] <- factor(grid[[x_var]])
+
+    ggplot(d, aes(x = x, y = y)) +
+      geom_boxplot(alpha = 0.15, outlier.shape = NA) +
+      geom_point(position = position_jitter(width = 0.08), size = 3, color = cols$point) +
+      geom_errorbar(
+        data = grid,
+        aes(x = .data[[x_var]], ymin = lwr, ymax = upr),
+        inherit.aes = FALSE,
+        width = 0.15,
+        linewidth = 1.0,
+        color = cols$line
+      ) +
+      geom_point(
+        data = grid,
+        aes(x = .data[[x_var]], y = yhat),
+        inherit.aes = FALSE,
+        shape = 18,
+        size = 4,
+        color = cols$line
+      ) +
+      ggrepel::geom_text_repel(aes(label = Country), size = 3.5, max.overlaps = Inf) +
+      labs(
+        title    = paste0(title_lab(y_var), " ~ ", x_var),
+        subtitle = paste0(stats$r2_lab, " = ", r2_txt, " | p = ", p_txt),
+        x = x_lab(x_var),
+        y = y_lab(y_var)
+      ) +
+      theme_minimal(base_size = 14)
+  }
+}
+
+# ------------------------------------------------------------------
+# Build + print plots
+# ------------------------------------------------------------------
+p_any  <- plot_model(m_any,  "AMG_Prev", summary_df)
+p_tet  <- plot_model(m_tet,  "TetM",     summary_df)
+p_rich <- plot_model(m_rich, "Richness", summary_df)   # uses manual_r2$Richness
+p_shan <- plot_model(m_shan, "Shannon",  summary_df)
+
+print(p_any)
+print(p_tet)
+print(p_rich)
+print(p_shan)
+
+```
+
+
+```{r}
+###############################################################################
+## Stewardship stacked bars (0–5) + weighted score (0–25) + overlays:
+## 1) Any ARG (squares) + 2) TetM (triangles)
+## Subtitle = R² and p for both ~ Weighted_0_25
+################################################################################
+# domain columns used in the stacked bars
+domains <- names(domain_weights)   # or: domains <- needed_domains
+# ---- Long format for stacked bars --------------------------------------------
+stewardship_long <- stewardship_ranks_df %>%
+  select(Country, all_of(domains)) %>%
+  pivot_longer(
+    cols = all_of(domains),
+    names_to = "Domain",
+    values_to = "Score"
+  ) %>%
+  mutate(
+    Domain_lab = Domain %>%
+      str_replace_all("_", " ") %>%
+      str_replace("Requirement", "(Req.)") %>%
+      str_replace("Monitoring", "(Monitor)") %>%
+      str_trim()
+  )
+
+# ---- Vibrant color scheme (mapped to Domain_lab) -----------------------------
+stewardship_colors <- c(
+  "OTC Ban Humans Animals"          = "#009E73",
+  "Advanced Stewardship"            = "#F0E442",
+  "Enforcement and (Monitor)"       = "#56B4E9",
+  "Human Prescription (Req.)"       = "#6B5B95",
+  "Veterinary Prescription (Req.)"  = "#CC79A7"
+)
+
+miss_cols <- setdiff(unique(stewardship_long$Domain_lab), names(stewardship_colors))
+if (length(miss_cols) > 0) warning("No color defined for: ", paste(miss_cols, collapse = ", "))
+
+# ---- Weighted score (0–25) per country ---------------------------------------
+weighted_df <- stewardship_long %>%
+  mutate(
+    Weight  = unname(domain_weights[Domain]),
+    contrib = Score * Weight
+  ) %>%
+  group_by(Country) %>%
+  summarise(
+    Total_Score   = sum(Score, na.rm = TRUE),                 # 0–5
+    Weighted_0_25 = 25 * sum(contrib, na.rm = TRUE),          # 0–25
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # map 0–25 onto left axis (0–5)
+    Weighted_on_left = Weighted_0_25 / 5
+  )
+
+# ---- Join outcomes for overlays (Any ARG + TetM) -----------------------------
+# Uses summary_df created earlier in your pipeline
+overlay_df <- summary_df %>%
+  select(Country, AMG_Prev, TetM) %>%
+  left_join(weighted_df %>% select(Country, Weighted_0_25, Weighted_on_left), by = "Country")
+
+# ---- Order countries by weighted score ---------------------------------------
+country_order <- weighted_df %>%
+  arrange(desc(Weighted_0_25)) %>%
+  pull(Country)
+
+stewardship_long <- stewardship_long %>%
+  mutate(Country = factor(Country, levels = country_order))
+
+weighted_df <- weighted_df %>%
+  mutate(Country = factor(Country, levels = country_order))
+
+overlay_df <- overlay_df %>%
+  mutate(Country = factor(Country, levels = country_order))
+
+# ---- Scale outcomes to left axis height (0–5) --------------------------------
+# (so they overlay on the stacked bars)
+overlay_df <- overlay_df %>%
+  mutate(
+    AMG_scaled  = AMG_Prev * 5,
+    TetM_scaled = TetM * 5
+  )
+
+# ---- Models for subtitle: outcome ~ Weighted_0_25 ----------------------------
+lm_any  <- lm(AMG_Prev ~ Weighted_0_25, data = overlay_df)
+lm_tetm <- lm(TetM     ~ Weighted_0_25, data = overlay_df)
+
+r2_any  <- summary(lm_any)$r.squared
+p_any   <- coef(summary(lm_any))["Weighted_0_25", "Pr(>|t|)"]
+
+r2_tetm <- summary(lm_tetm)$r.squared
+p_tetm  <- coef(summary(lm_tetm))["Weighted_0_25", "Pr(>|t|)"]
+
+subtitle_txt <- paste0(
+  "AMG_Prev ~ Total R² = ", sprintf("%.3f", r2_any),  ", p = ", formatC(p_any,  format = "g", digits = 3),
+  " | TetM ~ Total: R² = ", sprintf("%.3f", r2_tetm), ", p = ", formatC(p_tetm, format = "g", digits = 3)
+)
+
+# ---- Plot --------------------------------------------------------------------
+ggplot(stewardship_long, aes(x = Country, y = Score, fill = Domain_lab)) +
+  geom_col(color = "white", linewidth = 0.3) +
+
+  # weighted score dot (0–25; mapped to left axis)
+  geom_point(
+    data = weighted_df,
+    aes(x = Country, y = Weighted_on_left),
+    inherit.aes = FALSE,
+    size = 3.2,
+    color = "black"
+  ) +
+  geom_text(
+    data = weighted_df,
+    aes(x = Country, y = Weighted_on_left, label = sprintf("%.1f", Weighted_0_25)),
+    inherit.aes = FALSE,
+    vjust = -0.8,
+    size = 3.5,
+    fontface = "bold",
+    color = "black"
+  ) +
+
+  # Any ARG overlay (squares)
+geom_point(
+  data = overlay_df,
+  aes(x = Country, y = AMG_scaled, 
+      shape = "Any ARG (AMG_Prev)",
+      color = "Any ARG (AMG_Prev)"),
+  inherit.aes = FALSE,
+  size = 3.3
+) +
+geom_line(
+  data = overlay_df,
+  aes(x = Country, y = AMG_scaled, 
+      group = 1,
+      linetype = "Any ARG (AMG_Prev)",
+      color = "Any ARG (AMG_Prev)"),
+  inherit.aes = FALSE,
+  linewidth = 0.9
+) +
+
+# TetM overlay (triangles)
+geom_point(
+  data = overlay_df,
+  aes(x = Country, y = TetM_scaled, 
+      shape = "TetM",
+      color = "TetM"),
+  inherit.aes = FALSE,
+  size = 3.5
+) +
+geom_line(
+  data = overlay_df,
+  aes(x = Country, y = TetM_scaled, 
+      group = 1,
+      linetype = "TetM",
+      color = "TetM"),
+  inherit.aes = FALSE,
+  linewidth = 0.9
+) +
+scale_color_manual(
+  name = NULL,
+  values = c(
+    "Any ARG (AMG_Prev)" = "red",
+    "TetM" = "blue"
+  )
+) +
+  scale_y_continuous(
+    limits = c(0, 5.3),
+    breaks = 0:5,
+    name = "Stewardship score (unweighted total = 5)",
+    sec.axis = sec_axis(
+      trans = ~ . * 5,
+      name = "Weighted stewardship score (0–25)"
+    )
+  ) +
+
+  scale_fill_manual(values = stewardship_colors) +
+
+  # shapes: square + triangle
+  scale_shape_manual(
+    name = NULL,
+    values = c("Any ARG (AMG_Prev)" = 15, "TetM" = 17)
+  ) +
+scale_linetype_manual(
+  name = NULL,
+  values = c(
+    "Any ARG (AMG_Prev)" = "dashed",
+    "TetM" = "dashed"
+  )
+) +
+
+  labs(
+    title = "Stewardship domains (stacked) with weighted score + ARG overlays",
+    subtitle = subtitle_txt,
+    x = "Country (ordered by weighted score)",
+    fill = "Domain"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+
+```
+
+
+```{r}
+Any_ARG_Stewardship_Domains <- glm(
+  AMG_Prev ~ 
+    OTC_Ban_Humans_Animals +
+    Advanced_Stewardship +
+    Enforcement_and_Monitoring +
+    Human_Prescription_Requirement +
+    Veterinary_Prescription_Requirement,
+  data = summary_df
+)
+
+summ(Any_ARG_Stewardship_Domains)
+performance::check_collinearity(Any_ARG_Stewardship_Domains)
+
+stew_1 <- lm(AMG_Prev ~ OTC_Ban_Humans_Animals, data = summary_df)
+stew_2 <- lm(AMG_Prev ~ Advanced_Stewardship, data = summary_df)
+stew_3 <- lm(AMG_Prev ~ Enforcement_and_Monitoring, data = summary_df)
+stew_4 <- lm(AMG_Prev ~ Human_Prescription_Requirement, data = summary_df)
+stew_5 <- lm(AMG_Prev ~ Veterinary_Prescription_Requirement, data = summary_df)
+
+summ(stew_1)
+summ(stew_2)
+summ(stew_3)
+summ(stew_4)
+summ(stew_5)
+
+performance::model_performance(stew_1)
+performance::model_performance(stew_2)
+performance::model_performance(stew_3)
+performance::model_performance(stew_4)
+performance::model_performance(stew_5)
+
+```
+
+
+
+
+
+```{r}
+TetM_Stewardship_Domains <- glm(
+  TetM ~ 
+    OTC_Ban_Humans_Animals +
+    Advanced_Stewardship +
+    Enforcement_and_Monitoring +
+    Human_Prescription_Requirement +
+    Veterinary_Prescription_Requirement,
+  data = summary_df
+)
+
+summ(TetM_Stewardship_Domains)
+performance::check_collinearity(TetM_Stewardship_Domains)
+
+tetm_stew_1 <- lm(TetM ~ OTC_Ban_Humans_Animals, data = summary_df)
+tetm_stew_2 <- lm(TetM ~ Advanced_Stewardship, data = summary_df)
+tetm_stew_3 <- lm(TetM ~ Enforcement_and_Monitoring, data = summary_df)
+tetm_stew_4 <- lm(TetM ~ Human_Prescription_Requirement, data = summary_df)
+tetm_stew_5 <- lm(TetM ~ Veterinary_Prescription_Requirement, data = summary_df)
+
+summ(tetm_stew_1)
+summ(tetm_stew_2)
+summ(tetm_stew_3)
+summ(tetm_stew_4)
+summ(tetm_stew_5)
+
+```
+
+
+
+
+
+```{r}
+################################################################################
+## Pretty "Top 6 Models" Table for 2 Stewardship-Domain Dredges
+## (AMG_Prev and TetM; predictor set = stewardship policy domains)
+################################################################################
+
+# ---- Guards (minimal) --------------------------------------------------------
+if (!requireNamespace("MuMIn", quietly = TRUE)) stop("Install MuMIn: install.packages('MuMIn')")
+if (!requireNamespace("AICcmodavg", quietly = TRUE)) stop("Install AICcmodavg: install.packages('AICcmodavg')")
+if (!requireNamespace("dplyr", quietly = TRUE)) stop("Install dplyr: install.packages('dplyr')")
+if (!requireNamespace("tibble", quietly = TRUE)) stop("Install tibble: install.packages('tibble')")
+
+has_knitr <- requireNamespace("knitr", quietly = TRUE)
+has_kableExtra <- requireNamespace("kableExtra", quietly = TRUE)
+
+# ---- Sanity checks -----------------------------------------------------------
+need_cols <- c(
+  "AMG_Prev", "TetM",
+  "OTC_Ban_Humans_Animals", "Advanced_Stewardship", "Enforcement_and_Monitoring",
+  "Human_Prescription_Requirement", "Veterinary_Prescription_Requirement"
+)
+
+miss_cols <- setdiff(need_cols, names(summary_df))
+if (length(miss_cols)) stop("Missing columns in summary_df: ", paste(miss_cols, collapse = ", "))
+
+# ---- 1) Global models (same predictor set) -----------------------------------
+m_any_stew_global <- lm(
+  AMG_Prev ~
+    OTC_Ban_Humans_Animals +
+    Advanced_Stewardship +
+    Enforcement_and_Monitoring +
+    Human_Prescription_Requirement +
+    Veterinary_Prescription_Requirement,
+  data = summary_df
+)
+
+m_tetm_stew_global <- lm(
+  TetM ~
+    OTC_Ban_Humans_Animals +
+    Advanced_Stewardship +
+    Enforcement_and_Monitoring +
+    Human_Prescription_Requirement +
+    Veterinary_Prescription_Requirement,
+  data = summary_df
+)
+
+# ---- 2) Dredge (na.fail required) --------------------------------------------
+old_na_action <- getOption("na.action")
+options(na.action = "na.fail")
+on.exit(options(na.action = old_na_action), add = TRUE)
+
+dd_any_stew  <- MuMIn::dredge(m_any_stew_global)
+dd_tetm_stew <- MuMIn::dredge(m_tetm_stew_global)
+
+# ---- 3) Helpers for Top-N table ----------------------------------------------
+get_terms <- function(m) {
+  trms <- attr(stats::terms(m), "term.labels")
+  if (length(trms) == 0L) "(Intercept only)" else paste(trms, collapse = " + ")
+}
+
+build_aic_table_from_dredge <- function(dredge_obj, response_name, top_n = 6) {
+  df <- as.data.frame(dredge_obj)
+
+  n_keep <- min(top_n, nrow(df))
+  df_top <- df[seq_len(n_keep), , drop = FALSE]
+
+  mods_top <- MuMIn::get.models(dredge_obj, subset = seq_len(n_keep))
+  model_comp <- vapply(mods_top, get_terms, character(1))
+
+  tibble::tibble(
+    Response          = response_name,
+    Model             = paste0("M", seq_len(n_keep)),
+    model_composition = model_comp,
+    K                 = df_top$df,
+    AICc              = round(df_top$AICc, 2),
+    Delta_AICc        = round(df_top$delta, 2),
+    Weight_wi         = round(as.numeric(df_top$weight), 3)
+  )
+}
+
+# ---- 4) Build + combine Top 6 tables -----------------------------------------
+top6_any_stew  <- build_aic_table_from_dredge(dd_any_stew,  "Any ARG (AMG_Prev) | stewardship domains", top_n = 6)
+top6_tetm_stew <- build_aic_table_from_dredge(dd_tetm_stew, "TetM prevalence | stewardship domains",    top_n = 6)
+
+final_top6_stew <- dplyr::bind_rows(top6_any_stew, top6_tetm_stew)
+
+# ---- 5) Pretty render ---------------------------------------------------------
+if (has_knitr && has_kableExtra) {
+  final_top6_stew %>%
+    knitr::kable(
+      format = "html",
+      caption = "Top 6 candidate stewardship-domain models (ranked by AICc) for each response",
+      align = "l"
+    ) %>%
+    kableExtra::kable_styling(
+      full_width = FALSE,
+      bootstrap_options = c("striped", "hover", "condensed")
+    ) %>%
+    kableExtra::column_spec(3, width = "30em") %>%
+    kableExtra::collapse_rows(columns = 1, valign = "top") %>%
+    kableExtra::row_spec(0, bold = TRUE)
+} else {
+  print(final_top6_stew)
+}
+
+
+```
+
+
+
+
+
+```{r}
+################################################################################
+## Predictor importance (Σ wi) for stewardship-domain dredge
+## Response: Any ARG (AMG_Prev)
+################################################################################
+
+library(dplyr)
+library(tibble)
+
+importance_from_dredge <- function(dd, gene_name, digits = 2) {
+  imp <- MuMIn::sw(dd)  # sum of Akaike weights per predictor
+  tibble(
+    gene = gene_name,
+    parameter = names(imp),
+    importance_weight = round(as.numeric(imp), digits)
+  ) %>%
+    arrange(desc(importance_weight))
+}
+
+final_importance_stew <- importance_from_dredge(
+  dd_any_stew,
+  "Any ARG | stewardship domains"
+)
+
+final_importance_stew
+
+```
+
+
+
+
+
+```{r}
+################################################################################
+## LN model plots: Any ARG ~ Enforcement_and_Monitoring; TetM ~ OTC Ban
+## Points + fitted line + 95% CI + country labels + R² + p
+################################################################################
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ---- Fit LN models -----------------------------------------------------------
+m_any_enforce <- lm(AMG_Prev ~ Enforcement_and_Monitoring, data = summary_df)
+m_tetm_otc    <- lm(TetM ~ OTC_Ban_Humans_Animals, data = summary_df)
+
+# ---- Helper: R² and p-value for the single predictor ------------------------
+get_r2_p_single <- function(m, x_var) {
+  sm <- summary(m)
+  p  <- if (x_var %in% rownames(sm$coefficients)) sm$coefficients[x_var, 4] else NA_real_
+  list(r2 = unname(sm$r.squared), p = p)
+}
+
+# ---- Helper: prediction grid + 95% CI ---------------------------------------
+make_pred_grid_ci_lm <- function(m, dat, x_var, n = 100) {
+  x_seq <- seq(min(dat[[x_var]], na.rm = TRUE),
+               max(dat[[x_var]], na.rm = TRUE),
+               length.out = n)
+  grid <- tibble(!!x_var := x_seq)
+
+  pr <- predict(m, newdata = grid, se.fit = TRUE)
+  grid$yhat <- as.numeric(pr$fit)
+  grid$lwr  <- grid$yhat - 1.96 * pr$se.fit
+  grid$upr  <- grid$yhat + 1.96 * pr$se.fit
+  grid
+}
+
+# ---- Plot builder (numeric x) ------------------------------------------------
+plot_ln_numeric <- function(dat, y_var, x_var, model, title, xlab, ylab,
+                            point_col = "#1f77b4", line_col = "#d62728", fill_col = "#1f77b4") {
+
+  stats <- get_r2_p_single(model, x_var)
+  r2_txt <- sprintf("%.3f", stats$r2)
+  p_txt  <- formatC(stats$p, format = "g", digits = 3)
+
+  d <- dat %>% select(Country, all_of(y_var), all_of(x_var)) %>%
+    rename(y = all_of(y_var), x = all_of(x_var))
+
+  grid <- make_pred_grid_ci_lm(model, dat, x_var, n = 100)
+
+  ggplot(d, aes(x = x, y = y)) +
+    geom_point(size = 3, color = point_col) +
+    geom_ribbon(
+      data = grid,
+      aes(x = .data[[x_var]], ymin = lwr, ymax = upr),
+      inherit.aes = FALSE,
+      alpha = 0.18,
+      fill = fill_col
+    ) +
+    geom_line(
+      data = grid,
+      aes(x = .data[[x_var]], y = yhat),
+      inherit.aes = FALSE,
+      linewidth = 1.2,
+      color = line_col
+    ) +
+    ggrepel::geom_text_repel(aes(label = Country), size = 3.5, max.overlaps = Inf) +
+    labs(
+      title    = title,
+      subtitle = paste0("R² = ", r2_txt, " | p = ", p_txt),
+      x = xlab,
+      y = ylab
+    ) +
+    theme_minimal(base_size = 14)
+}
+
+# ---- Build plots -------------------------------------------------------------
+p_any_enforce <- plot_ln_numeric(
+  dat   = summary_df,
+  y_var = "AMG_Prev",
+  x_var = "Enforcement_and_Monitoring",
+  model = m_any_enforce,
+  title = "Any ARG prevalence ~ Enforcement & Monitoring (LN model)",
+  xlab  = "Enforcement & Monitoring (stewardship domain score)",
+  ylab  = "Any ARG prevalence (AMG_Prev)",
+  point_col = "#1f77b4",
+  line_col  = "#d62728",
+  fill_col  = "#1f77b4"
+)
+
+p_tetm_otc <- plot_ln_numeric(
+  dat   = summary_df,
+  y_var = "TetM",
+  x_var = "OTC_Ban_Humans_Animals",
+  model = m_tetm_otc,
+  title = "TetM prevalence ~ OTC Ban (LN model)",
+  xlab  = "OTC Ban (humans/animals) (stewardship domain score)",
+  ylab  = "TetM prevalence",
+  point_col = "#2ca02c",
+  line_col  = "#9467bd",
+  fill_col  = "#2ca02c"
+)
+
+print(p_any_enforce)
+print(p_tetm_otc)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
